@@ -1,0 +1,152 @@
+from airflow import DAG
+from airflow.decorators import task
+from airflow.models import Variable
+from datetime import datetime, timedelta
+import logging
+import snowflake.connector
+
+def get_snowflake_conn():
+    return snowflake.connector.connect(
+        account=Variable.get("snowflake_account"),
+        user=Variable.get("snowflake_username"),
+        password=Variable.get("snowflake_password"),
+        warehouse=Variable.get("snowflake_warehouse", "compute_wh"),
+        database="vantage_DB",
+        schema="vantage.raw_data"
+    )
+
+# Default DAG arguments
+default_args = {
+    'owner': 'Lab1',
+    'start_date': datetime(2023, 1, 1),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+# Define the DAG
+with DAG(
+    dag_id='BuildELT_CTAS',  
+    default_args=default_args,
+    schedule_interval=None,  
+    catchup=False
+) as dag:
+
+    @task
+    def create_tables():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Create the user_session_channel table
+            create_user_session_table = """
+            CREATE TABLE IF NOT EXISTS vantage.raw_data.user_session_channel (
+                userId int NOT NULL,
+                sessionId varchar(32) PRIMARY KEY,
+                channel varchar(32) DEFAULT 'direct'
+            );
+            """
+            cur.execute(create_user_session_table)
+            logging.info("Table vantage.raw_data.user_session_channel created successfully.")
+
+            # Create the session_timestamp table
+            create_session_timestamp_table = """
+            CREATE TABLE IF NOT EXISTS vantage.raw_data.session_timestamp (
+                sessionId varchar(32) PRIMARY KEY,
+                ts timestamp
+            );
+            """
+            cur.execute(create_session_timestamp_table)
+            logging.info("Table vantage.raw_data.session_timestamp created successfully.")
+        except Exception as e:
+            logging.error(f"Error creating tables: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def set_stage():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Create a stage for CSV data
+            create_stage = """
+            CREATE OR REPLACE STAGE vantageraw_data.blob_stage
+            url = 's3://s3-geospatial/readonly/'
+            file_format = (type = csv, skip_header = 1, field_optionally_enclosed_by = '"');
+            """
+            cur.execute(create_stage)
+            logging.info("Stage vantage.raw_data.blob_stage created successfully.")
+        except Exception as e:
+            logging.error(f"Error creating stage: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def load_data():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Copy data into user_session_channel
+            copy_user_session_channel = """
+            COPY INTO vantage.raw_data.user_session_channel
+            FROM @raw_data.blob_stage/user_session_channel.csv;
+            """
+            cur.execute(copy_user_session_channel)
+            logging.info("Data copied into vantage.raw_data.user_session_channel successfully.")
+
+            # Copy data into session_timestamp
+            copy_session_timestamp = """
+            COPY INTO vantage.raw_data.session_timestamp
+            FROM @raw_data.blob_stage/session_timestamp.csv;
+            """
+            cur.execute(copy_session_timestamp)
+            logging.info("Data copied into vantage.raw_data.session_timestamp successfully.")
+        except Exception as e:
+            logging.error(f"Error loading data: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    @task
+    def create_session_summary():
+        conn = get_snowflake_conn()
+        cur = conn.cursor()
+        try:
+            # Switch to analytics schema
+            cur.execute("USE SCHEMA analytics")
+
+            # Create the session_summary table with the requested columns
+            create_session_summary_table = """
+            CREATE TABLE IF NOT EXISTS analytics.session_summary AS
+            SELECT
+                usc.userId,
+                usc.sessionId,
+                usc.channel,
+                st.ts
+            FROM
+                vantage.raw_data.user_session_channel usc
+            JOIN
+                vantage.raw_data.session_timestamp st
+            ON
+                usc.sessionId = st.sessionId;
+            """
+            cur.execute(create_session_summary_table)
+            logging.info("Table analytics.session_summary created successfully with columns userId, sessionId, channel, and ts.")
+        except Exception as e:
+            logging.error(f"Error creating session summary: {e}")
+            raise e
+        finally:
+            cur.close()
+            conn.close()
+
+    # Task definitions
+    create_tables_task = create_tables()
+    set_stage_task = set_stage()
+    load_data_task = load_data()
+    create_session_summary_task = create_session_summary()
+
+    # Task dependencies
+    create_tables_task >> set_stage_task >> load_data_task >> create_session_summary_task
